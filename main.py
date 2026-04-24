@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 import google.genai as genai
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Type, Any
 import os
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
@@ -19,7 +19,7 @@ except Exception as e:
 if client is None:
     raise RuntimeError("Gemini client not initialized")
 
-prompt = f"""
+job_suggestion_prompt = f"""
             Please choose the 5 most suitable job roles for the candidate based on the resume provided. 
             For each job role, provide a short reason for why it is suitable and 
             assign a score out of 10 indicating the suitability of the candidate for that role.
@@ -43,7 +43,7 @@ class ResumeRequest(BaseModel):
 async def root():
     return {"message": "Hello World"}
 
-def analyze_resume_text(resume_text: str) ->JobList:
+def resume_text_validator(resume_text: str):
     if not resume_text or len(resume_text.strip()) < 30:
         raise HTTPException(
             status_code=400,
@@ -62,30 +62,41 @@ def analyze_resume_text(resume_text: str) ->JobList:
     #         detail="Invalid resume format"
     #     )
 
+def get_response_from_gemini(prompt: str, resume_text: str, schema):
     try:
         response = client.models.generate_content(
             model="gemini-3-flash-preview",
             contents=prompt + "\n" + resume_text,
             config={
                 "response_mime_type": "application/json",
-                "response_json_schema": JobList.model_json_schema(),
+                "response_json_schema": schema,
             },
         )
 
         if not response.text:
             raise HTTPException(status_code=500, detail="Empty response from Gemini")
+        
+        return response
     except Exception as e:
         print(f"Error generating content: {e}")
         raise HTTPException(status_code=500, detail="Error generating content from Gemini API")
 
+def response_validator(response: Any, model: Type[BaseModel]):
     try:
-        job_list = JobList.model_validate_json(response.text)
+        parsed = model.model_validate_json(response.text)
+        return parsed
     except Exception as e:
-        print("Raw response:", response.text)
         raise HTTPException(
             status_code=500,
             detail="Invalid JSON response from Gemini API"
         )
+
+def analyze_resume_text(resume_text: str) ->JobList:
+    resume_text_validator(resume_text)
+
+    response = get_response_from_gemini(job_suggestion_prompt, resume_text, JobList.model_json_schema())
+
+    job_list = response_validator(response, JobList)
 
     if len(job_list.jobs) != 5:
         raise HTTPException(
@@ -114,14 +125,14 @@ def analyze_resume(request: ResumeRequest):
     resume_text = request.resume_text
     return analyze_resume_text(resume_text)
 
-def extract_text_from_pdf(file: UploadFile) -> str:
+def extract_text_from_pdf(file: UploadFile = File(...)) -> str:
     try: 
         reader = PdfReader(file.file)
 
         text = ""
 
         for pages in reader.pages:
-            text += pages.extract_text()
+            text += pages.extract_text() or ""
         
         text = text.strip()
 
@@ -130,13 +141,46 @@ def extract_text_from_pdf(file: UploadFile) -> str:
         
         return text.strip()
     except Exception as e:
-        raise HTTPException(400, detail="Error reading PDF file")
+        raise HTTPException(400, detail="Failed to extract text from PDF")
 
 
 @app.post("/analyze-resume-pdf", response_model=JobList)
-def analyze_resume_pdf(file: UploadFile):
+def analyze_resume_pdf(file: UploadFile = File(...)):
     if(file.content_type != "application/pdf"):
         raise HTTPException(400, detail="Invalid file type. Please upload a PDF file.")
     
     resume_text = extract_text_from_pdf(file)
     return analyze_resume_text(resume_text)
+
+
+class MissingSkills(BaseModel):
+    missing_skills: List[str] = Field(description="List of missing skills")
+
+missing_skills_prompt = """
+Analyze the resume and identify the top missing skills required to improve the candidate's profile for high-paying technical roles.
+
+Rules:
+- Return exactly 5 missing skills
+- Keep skills concise (1–3 words each)
+- Focus on practical/industry-relevant skills
+- Do not include explanations
+- Output must strictly follow JSON schema
+
+Resume:
+"""
+
+@app.post("/missing-skills", response_model=MissingSkills)
+def get_missing_skills(request: ResumeRequest) -> MissingSkills:
+    resume_text_validator(request.resume_text)
+
+    response = get_response_from_gemini(missing_skills_prompt, request.resume_text, MissingSkills.model_json_schema())
+
+    missing_skills = response_validator(response, MissingSkills)
+
+    if len(missing_skills.missing_skills) != 5:
+        raise HTTPException(
+        status_code=400,
+        detail="Gemini API did not return exactly 5 missing skills"
+    )
+
+    return missing_skills
